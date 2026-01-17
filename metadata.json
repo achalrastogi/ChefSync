@@ -1,0 +1,7 @@
+{
+  "name": "ChefSync: Daily Cooking To-Do",
+  "description": "A personal cooking planner that turns your available ingredients and time into a structured, actionable daily to-do list and prep guide.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
