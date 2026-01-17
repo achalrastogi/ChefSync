@@ -1,25 +1,30 @@
 
-import { GoogleGenAI, Type } from "@google/genai";
-import { CookingInput, CookingPlan, RecipeOption, GroceryList, OptimizationGoal, CityType, DailySchedule } from "../types";
+import { GoogleGenAI, Type, GenerateContentParameters } from "@google/genai";
+import { CookingInput, CookingPlan, RecipeOption, GroceryList, CityType, DailySchedule, MealType } from "../types";
 import { logError, measurePerformance } from "./analytics";
 
-const getAI = () => new GoogleGenAI({ apiKey: process.env.API_KEY });
+/**
+ * SOLID: Helper to ensure fresh instance per call as per SDK guidelines
+ */
+const getAIClient = () => new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-async function withRetry<T>(fn: () => Promise<T>, retries = 2): Promise<T> {
+/**
+ * DRY: Centralized handler for all Gemini text-based content generation
+ */
+async function callGeminiText(params: GenerateContentParameters, label: string): Promise<string> {
+  const startTime = performance.now();
   try {
-    return await fn();
+    const ai = getAIClient();
+    const response = await ai.models.generateContent(params);
+    measurePerformance(label, startTime);
+    return response.text || "";
   } catch (error) {
-    if (retries > 0) {
-      console.warn(`Gemini API busy, retrying... (${retries} left)`);
-      await new Promise(r => setTimeout(r, 1000));
-      return withRetry(fn, retries - 1);
-    }
+    logError(error as Error, label);
     throw error;
   }
 }
 
-// Shared recipe schema part to avoid duplication and fix invalid $ref usage which is not supported in @google/genai
-const recipeSchemaPart = {
+const RECIPE_SCHEMA = {
   type: Type.OBJECT,
   properties: {
     recipeName: { type: Type.STRING },
@@ -49,104 +54,99 @@ const recipeSchemaPart = {
       } 
     },
     additionalNotes: { type: Type.STRING },
-    budgetFeasibility: { type: Type.STRING },
+    budgetFeasibility: { type: Type.STRING, description: "Must be 'Budget Validated' or 'Budget Risk'" },
     estimatedCostValue: { type: Type.NUMBER },
     isFallback: { type: Type.BOOLEAN },
-    imagePrompt: { type: Type.STRING },
-    fallbacks: { 
-      type: Type.ARRAY, 
-      items: { 
-        type: Type.OBJECT,
-        properties: {
-          recipeName: { type: Type.STRING },
-          description: { type: Type.STRING },
-          estimatedCostValue: { type: Type.NUMBER }
-        }
-      } 
-    }
+    imagePrompt: { type: Type.STRING }
   },
   required: ["recipeName", "description", "totalTime", "ingredientsUsed", "prepChecklist", "cookingSequence", "budgetFeasibility", "estimatedCostValue", "imagePrompt"]
 };
 
-// Fix: Inline recipe schema as $ref is not supported and use gemini-3-flash-preview
-export async function generateFullSchedule(input: CookingInput, days: number = 1): Promise<DailySchedule> {
-  const startTime = performance.now();
-  const goalText = input.optimizationGoal ? `Optimize specifically for ${input.optimizationGoal}.` : "";
-  
+export async function generateFullSchedule(input: CookingInput, days: number = 3): Promise<DailySchedule> {
   const prompt = `
-    Act as a professional chef and strict budget meal planning auditor.
-    Generate a full ${days}-day cooking schedule (Breakfast, Lunch, Dinner for each day).
-
-    CRITICAL COMPLIANCE RULES:
-    1. INGREDIENT LOCK: Every single meal MUST use at least 3 ingredients from this specific list: [${input.ingredients.join(', ')}].
-    2. BUDGET VALIDATION GATE: Each meal must not exceed a 1/3 portion of the daily budget of ${input.dailyBudget} INR for a ${input.cityType} economy.
-    3. EXPLICIT FALLBACKS: If a meal's cost is risky, provide exactly two "Ultra-Budget Fallback" options within the 'fallbacks' array of that recipe object.
-    4. Labels: Fallbacks MUST be titled "Ultra-Budget Fallback 1" and "Ultra-Budget Fallback 2".
-    5. DAY-BASED OUTPUT: Organize by Day 1 to Day ${days}.
-
-    User Profile:
-    - Diet: ${input.diet}
-    - Kitchen: ${input.kitchenSetup}
-    - Optimization: ${goalText}
+    Generate a ${days}-day cooking schedule for a ${input.diet} diet starting from ${input.targetDate}.
+    Each day must have breakfast, lunch, and dinner.
     
-    Output JSON only in the schema provided.
+    IMPORTANT RULES:
+    - Use date format: YYYY-MM-DD for the 'date' field.
+    - Each day must be sequential starting from ${input.targetDate}.
+    - Must use at least 3 from: [${input.ingredients.join(', ')}].
+    - Daily total budget for ${input.cityType}: ₹${input.dailyBudget}.
+    - Focus on ${input.optimizationGoal || 'Taste'}.
+    - Include substitution logic for ingredients if the user requested a specific diet or if the recipe is budget-constrained.
   `;
 
-  return withRetry(async () => {
-    const ai = getAI();
-    const response = await ai.models.generateContent({
-      model: 'gemini-3-flash-preview',
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            days: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  date: { type: Type.STRING },
-                  breakfast: recipeSchemaPart,
-                  lunch: recipeSchemaPart,
-                  dinner: recipeSchemaPart
-                },
-                required: ["date", "breakfast", "lunch", "dinner"]
-              }
+  const text = await callGeminiText({
+    model: 'gemini-3-flash-preview',
+    contents: prompt,
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          days: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                date: { type: Type.STRING, description: "Strict YYYY-MM-DD format" },
+                breakfast: RECIPE_SCHEMA,
+                lunch: RECIPE_SCHEMA,
+                dinner: RECIPE_SCHEMA
+              },
+              required: ["date", "breakfast", "lunch", "dinner"]
             }
-          },
-          required: ["days"]
-        }
+          }
+        },
+        required: ["days"]
       }
-    });
-    measurePerformance('generateFullSchedule', startTime);
-    return JSON.parse(response.text.trim());
-  });
+    }
+  }, 'generateFullSchedule');
+  return JSON.parse(text);
 }
 
-// Fix: Add missing discoverRecipesByIngredients export required by DiscoverySection.tsx
-export async function discoverRecipesByIngredients(ingredients: string[], cityType: CityType): Promise<RecipeOption[]> {
-  const startTime = performance.now();
-  const prompt = `Discover 4 creative and budget-friendly recipes using these ingredients: ${ingredients.join(', ')}. 
-  Adjust for a ${cityType} economy. Provide full recipe details in JSON.`;
+export async function generateChefTips(recipeName: string, ingredients: string[]): Promise<string> {
+  const prompt = `As a professional chef, provide 3 short, specific tips for ${recipeName} focusing on these ingredients: ${ingredients.join(', ')}.`;
+  return callGeminiText({
+    model: 'gemini-3-flash-preview',
+    contents: prompt
+  }, 'generateChefTips');
+}
 
-  return withRetry(async () => {
-    const ai = getAI();
-    const response = await ai.models.generateContent({
-      model: 'gemini-3-flash-preview',
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.ARRAY,
-          items: recipeSchemaPart
-        }
+export async function auditScheduleQuality(schedule: DailySchedule, input: CookingInput): Promise<{score: number, report: string, compliance: string}> {
+  const prompt = `
+    Audit the following cooking schedule against these constraints:
+    Diet: ${input.diet}
+    Budget: ₹${input.dailyBudget}
+    Ingredients Required: ${input.ingredients.join(', ')}
+    
+    Schedule to audit: ${JSON.stringify(schedule)}
+    
+    Check for:
+    1. Culinary logic (do the recipes make sense?)
+    2. Dietary purity (any meat in veg plans?)
+    3. Ingredient utilization (did it use the required locked ingredients?)
+    
+    Return a JSON report.
+  `;
+
+  const text = await callGeminiText({
+    model: 'gemini-3-pro-preview',
+    contents: prompt,
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          score: { type: Type.NUMBER, description: "Score from 0-100" },
+          report: { type: Type.STRING, description: "Short summary of findings" },
+          compliance: { type: Type.STRING, description: "Status: 'COMPLIANT' or 'NON_COMPLIANT'" }
+        },
+        required: ["score", "report", "compliance"]
       }
-    });
-    measurePerformance('discoverRecipesByIngredients', startTime);
-    return JSON.parse(response.text.trim());
-  });
+    }
+  }, 'auditScheduleQuality');
+  return JSON.parse(text);
 }
 
 export async function generateRecipeImage(prompt: string, highQuality = false): Promise<string> {
@@ -154,24 +154,27 @@ export async function generateRecipeImage(prompt: string, highQuality = false): 
   const startTime = performance.now();
   
   try {
-    return await withRetry(async () => {
-      const ai = getAI();
-      const response = await ai.models.generateContent({
-        model,
-        contents: {
-          parts: [{ text: `${prompt}. Cinematic food photography, warm lighting.` }]
-        },
-        config: highQuality ? { imageConfig: { imageSize: "1K", aspectRatio: "1:1" } } : { imageConfig: { aspectRatio: "1:1" } }
-      });
-
-      for (const part of response.candidates[0].content.parts) {
-        if (part.inlineData) {
-          measurePerformance(`generateRecipeImage_${model}`, startTime);
-          return `data:image/png;base64,${part.inlineData.data}`;
-        }
+    const ai = getAIClient();
+    const response = await ai.models.generateContent({
+      model,
+      contents: {
+        parts: [{ text: `${prompt}. High-quality professional food photography, shallow depth of field, warm lighting.` }]
+      },
+      config: { 
+        imageConfig: { 
+          aspectRatio: "1:1",
+          imageSize: highQuality ? "2K" : "1K"
+        } 
       }
-      throw new Error("No image part returned");
     });
+
+    for (const part of response.candidates[0].content.parts) {
+      if (part.inlineData) {
+        measurePerformance(`generateRecipeImage_${model}`, startTime);
+        return `data:image/png;base64,${part.inlineData.data}`;
+      }
+    }
+    throw new Error("No image data in response");
   } catch (error) {
     logError(error as Error, 'generateRecipeImage');
     return "https://images.unsplash.com/photo-1495521821757-a1efb6729352?q=80&w=800";
@@ -179,43 +182,66 @@ export async function generateRecipeImage(prompt: string, highQuality = false): 
 }
 
 export async function generateGroceryList(plans: CookingPlan[]): Promise<GroceryList> {
-  if (plans.length === 0) throw new Error("No plans provided");
-  const startTime = performance.now();
-  
-  const ingredientsString = plans.map(p => `${p.recipeName}: ${p.ingredientsUsed.join(', ')}`).join('\n');
-  const prompt = `Consolidated grocery list for: ${ingredientsString}. Provide city-adjusted INR costs for a ${plans[0].metadata.cityType} economy. JSON format.`;
-
-  return withRetry(async () => {
-    const ai = getAI();
-    const response = await ai.models.generateContent({
-      model: 'gemini-3-flash-preview',
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
+  const prompt = `Consolidate ingredients for: ${plans.map(p => p.recipeName).join(', ')}. Group by category and estimate costs in INR.`;
+  const text = await callGeminiText({
+    model: 'gemini-3-flash-preview',
+    contents: prompt,
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          items: {
+            type: Type.ARRAY,
             items: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  item: { type: Type.STRING },
-                  quantity: { type: Type.STRING },
-                  estimatedCost: { type: Type.STRING },
-                  category: { type: Type.STRING }
-                },
-                required: ["item", "quantity", "estimatedCost", "category"]
-              }
-            },
-            totalEstimatedBudget: { type: Type.STRING },
-            budgetFeasibilityNote: { type: Type.STRING }
+              type: Type.OBJECT,
+              properties: {
+                item: { type: Type.STRING },
+                quantity: { type: Type.STRING },
+                estimatedCost: { type: Type.STRING },
+                category: { type: Type.STRING }
+              },
+              required: ["item", "quantity", "estimatedCost", "category"]
+            }
           },
-          required: ["items", "totalEstimatedBudget"]
-        }
+          totalEstimatedBudget: { type: Type.STRING },
+          budgetFeasibilityNote: { type: Type.STRING }
+        },
+        required: ["items", "totalEstimatedBudget"]
       }
-    });
-    measurePerformance('generateGroceryList', startTime);
-    return JSON.parse(response.text.trim());
-  });
+    }
+  }, 'generateGroceryList');
+  return JSON.parse(text);
+}
+
+export async function swapMeal(input: CookingInput, date: string, mealType: MealType): Promise<RecipeOption> {
+  const prompt = `Provide a replacement ${mealType} for ${date} using [${input.ingredients.join(', ')}] under budget ₹${input.dailyBudget/3}. Ensure date is ${date}.`;
+  const text = await callGeminiText({
+    model: 'gemini-3-flash-preview',
+    contents: prompt,
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: RECIPE_SCHEMA
+    }
+  }, 'swapMeal');
+  return JSON.parse(text);
+}
+
+export async function discoverRecipesByIngredients(ingredients: string[], cityType: CityType): Promise<RecipeOption[]> {
+  const prompt = `Discover 3 distinct recipe options using these ingredients: ${ingredients.join(', ')}. 
+  Context: User lives in a ${cityType} city in India. 
+  Ensure recipes are culturally appropriate and respect budget constraints for this economy tier.`;
+
+  const text = await callGeminiText({
+    model: 'gemini-3-flash-preview',
+    contents: prompt,
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.ARRAY,
+        items: RECIPE_SCHEMA
+      }
+    }
+  }, 'discoverRecipesByIngredients');
+  return JSON.parse(text);
 }

@@ -35,6 +35,29 @@ export enum OptimizationGoal {
   FASTEST = 'FASTEST'
 }
 
+export enum Persona {
+  WORKING_PROFESSIONAL = 'WORKING_PROFESSIONAL',
+  STUDENT = 'STUDENT',
+  HOUSEHOLD = 'HOUSEHOLD'
+}
+
+export interface ReminderPreferences {
+  reminderTime: 'morning' | 'evening';
+  cookingSlotStart: string; 
+  cookingSlotEnd: string; 
+  remindersPerDay: 1 | 2;
+}
+
+export interface CalendarEvent {
+  id: string;
+  title: string;
+  description: string;
+  start: Date;
+  end: Date;
+  type: 'shopping' | 'prep' | 'cooking';
+  justification: string;
+}
+
 export type AsyncStatus = 'idle' | 'loading' | 'success' | 'error';
 
 export interface User {
@@ -50,6 +73,11 @@ export interface User {
   preferences: {
     highQualityVisuals: boolean;
   };
+  persona?: Persona;
+  onboardingComplete: boolean;
+  reminderPreferences: ReminderPreferences;
+  allergies?: string;
+  cookingTimePerMeal: number;
 }
 
 export interface CookingInput {
@@ -63,6 +91,7 @@ export interface CookingInput {
   cityType: CityType;
   dailyBudget: number;
   optimizationGoal?: OptimizationGoal;
+  allergies?: string;
 }
 
 export interface CookingStep {
@@ -94,10 +123,10 @@ export interface CookingPlan {
   cookingSequence: CookingStep[];
   additionalNotes: string;
   imageUrl?: string;
-  budgetFeasibility: string;
+  budgetFeasibility: 'Budget Validated' | 'Budget Risk';
   estimatedCostValue: number;
   isFallback?: boolean;
-  fallbacks?: RecipeOption[]; // For Ultra-Budget Fallback 1 & 2
+  fallbacks?: RecipeOption[];
   metadata: {
     mealType: MealType;
     date: string;
@@ -118,7 +147,7 @@ export interface RecipeOption {
   cookingSequence: CookingStep[];
   additionalNotes: string;
   imagePrompt: string;
-  budgetFeasibility: string;
+  budgetFeasibility: 'Budget Validated' | 'Budget Risk';
   estimatedCostValue: number;
   isFallback?: boolean;
   fallbacks?: RecipeOption[];
